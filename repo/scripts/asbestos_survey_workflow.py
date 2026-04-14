@@ -10,29 +10,59 @@ Asbestos Survey Automation Workflow
 # git test
 import os
 import sys
+import argparse
 from pathlib import Path
 from datetime import datetime
 import json
 import re
+import time
 import requests
 import win32com.client
-from PIL import Image
 import pytesseract
 import pdfplumber
+import win32print
+import win32api
+from PIL import Image
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    convert_from_path = None
 
 # ============================================================================
 # CONFIG & CREDENTIALS
 # ============================================================================
 
-CREDENTIALS_FILE = Path(r"c:\Users\Sherren\Desktop\feldman\scripts\credentials.txt")
+# Point pytesseract at the Tesseract install on Windows
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+BASE_DIR = Path(__file__).resolve().parent
+CREDENTIALS_FILE = BASE_DIR / "credentials.txt"
 TEMPLATE_JOBS = {
     "parkingeye": "G-25562",
     "g24": "G-25564"
 }
+ADDRESS_SKIP_TERMS = {
+    "signage plan",
+    "install doc",
+    "staff only",
+    "drawing",
+    "revision",
+    "parkingeye",
+    "greenshield",
+    "asbestos survey request",
+}
+UK_POSTCODE_RE = re.compile(
+    r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
+    re.IGNORECASE,
+)
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
 
 def load_credentials():
     """Load API credentials from file."""
     creds = {}
+    if not CREDENTIALS_FILE.exists():
+        return creds
+
     with open(CREDENTIALS_FILE, 'r') as f:
         for line in f:
             if '=' in line:
@@ -123,9 +153,11 @@ def get_outlook_emails_from_lewis(account_name=None):
                         "sender_email": sender_email,
                         "subject": item.Subject,
                         "body": item.Body,
+                        "html_body": getattr(item, "HTMLBody", ""),
                         "received_time": item.ReceivedTime,
                         "attachments": item.Attachments,
-                        "message_id": item.EntryID
+                        "message_id": item.EntryID,
+                        "outlook_item": item,
                     })
             except:
                 pass
@@ -189,21 +221,21 @@ def extract_address_from_pdf(pdf_path):
     print(f"  Extracting address from: {pdf_path.name}...")
     
     try:
+        if not Path(pdf_path).exists():
+            print("    [!] PDF file not found; skipping address extraction")
+            return None
+
         with pdfplumber.open(pdf_path) as pdf:
             text = ""
             for page in pdf.pages:
                 text += page.extract_text() or ""
         
-        # Simple regex patterns for common UK address formats
-        # Adjust as needed for your PDF structure
-        lines = text.split('\n')
-        address_candidates = [line.strip() for line in lines if line.strip() and len(line) > 10]
-        
-        # For now, return first plausible multi-line address
-        if address_candidates:
-            address = ", ".join(address_candidates[:3])
+        address = extract_address_from_text(text)
+        if address:
             print(f"    [OK] Extracted address: {address[:100]}...")
             return address
+
+        print("    [!] No address block with town/postcode found")
         return None
     
     except Exception as e:
@@ -223,28 +255,236 @@ def extract_po_number(email_body):
     print("    [!] No PO number found")
     return None
 
-def extract_site_contact_from_image(pdf_path):
-    """Extract site contact details from 'SITE CONTACT DETAILS' image block."""
-    print(f"  Extracting site contact from: {pdf_path.name}...")
-    
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Try to find images in PDF
-            for page_num, page in enumerate(pdf.pages):
-                if page.images:
-                    # Extract images from page
-                    for img_info in page.images:
-                        # Note: pdfplumber doesn't directly extract images
-                        # You may need additional library like pdf2image
-                        pass
-        
-        # Placeholder: would need pdf2image + pytesseract
-        print("    ! Site contact extraction requires additional setup (pdf2image)")
-        return None, None  # (email, name)
-    
-    except Exception as e:
-        print(f"    [ERROR] Error extracting site contact: {e}")
+def clean_address_line(line):
+    """Normalize a candidate address line."""
+    line = re.sub(r"\s+", " ", line.replace("|", " ")).strip(" ,.-")
+    return line
+
+def is_address_like_line(line):
+    """Return True for likely address lines, False for document noise."""
+    lowered = line.lower()
+    if not line or len(line) < 3:
+        return False
+    if any(term in lowered for term in ADDRESS_SKIP_TERMS):
+        return False
+    if "@" in line:
+        return False
+    if re.search(r"\bpage\s+\d+\b", lowered):
+        return False
+    return True
+
+def extract_address_from_text(text):
+    """Extract an address block that includes town and postcode."""
+    raw_lines = [clean_address_line(line) for line in text.splitlines()]
+    lines = [line for line in raw_lines if is_address_like_line(line)]
+
+    for index, line in enumerate(lines):
+        if not UK_POSTCODE_RE.search(line):
+            continue
+
+        block = []
+        start = max(0, index - 3)
+        for candidate in lines[start:index + 1]:
+            if candidate not in block:
+                block.append(candidate)
+
+        if len(block) < 2:
+            continue
+
+        postcode_match = UK_POSTCODE_RE.search(block[-1])
+        if not postcode_match:
+            continue
+
+        town_line = block[-2]
+        if any(char.isdigit() for char in town_line) and not re.search(r"\broad\b|\bstreet\b|\bavenue\b|\blane\b|\bdrive\b|\bclose\b|\bway\b", town_line, re.IGNORECASE):
+            continue
+
+        return ", ".join(block)
+
+    return None
+
+def extract_address_from_pdfs(pdf_paths):
+    """Try all PDFs until an address with town and postcode is found."""
+    for pdf_path in pdf_paths:
+        address = extract_address_from_pdf(pdf_path)
+        if address and UK_POSTCODE_RE.search(address):
+            return address
+    return None
+
+
+
+def extract_site_contact_details_from_text(text):
+    """Extract site contact details from OCR or plain text."""
+    normalized_text = text.replace("\r", "\n")
+    upper_text = normalized_text.upper()
+    if "SITE CONTACT DETAILS" not in upper_text and "SITE CONTACT" not in upper_text:
         return None, None
+
+    names = re.findall(r"Name[:\s]+([A-Z][a-zA-Z\s\-\']+)", normalized_text)
+    emails = re.findall(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
+        normalized_text,
+    )
+
+    print(f"    Names found:  {names}")
+    print(f"    Emails found: {emails}")
+
+    if names and emails:
+        return emails[0].strip(), names[0].strip()
+
+    email = emails[0].strip() if emails else None
+    name = names[0].strip() if names else None
+    return email, name
+
+def normalize_contact_name(name):
+    """Clean OCR noise from a contact name."""
+    if not name:
+        return None
+    name = re.sub(r"\s+", " ", name).strip(" ,.-")
+    if "activate.ps1" in name.lower():
+        return None
+    return name
+
+def normalize_contact_email(email):
+    """Clean OCR noise from an email address."""
+    if not email:
+        return None
+    email = email.strip().strip(" ,.;:")
+    email = email.replace(" ", "")
+    email = email.replace("..", ".")
+    return email.lower()
+
+def extract_contact_candidates_from_text(text):
+    """Extract one or more contact candidates from text."""
+    normalized_text = text.replace("\r", "\n")
+    upper_text = normalized_text.upper()
+    if "SITE CONTACT DETAILS" not in upper_text and "SITE CONTACT" not in upper_text:
+        return []
+
+    candidates = []
+    lines = [line.strip() for line in normalized_text.splitlines() if line.strip()]
+
+    current_name = None
+    for line in lines:
+        name_match = re.search(r"Name[:\s]+(.+)", line, re.IGNORECASE)
+        if name_match:
+            current_name = normalize_contact_name(name_match.group(1))
+            continue
+
+        email_match = re.search(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", line)
+        if email_match:
+            email = normalize_contact_email(email_match.group(1))
+            candidates.append({"name": current_name, "email": email})
+            current_name = None
+
+    if candidates:
+        return candidates
+
+    email, name = extract_site_contact_details_from_text(normalized_text)
+    if email or name:
+        return [{"name": normalize_contact_name(name), "email": normalize_contact_email(email)}]
+    return []
+
+def dedupe_contact_candidates(candidates):
+    """Remove duplicate contact candidates while preserving order."""
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        normalized = (
+            normalize_contact_name(candidate.get("name")),
+            normalize_contact_email(candidate.get("email")),
+        )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append({"name": normalized[0], "email": normalized[1]})
+    return deduped
+
+def get_attachment_mime_type(attachment):
+    """Read an Outlook attachment MIME type when available."""
+    try:
+        return attachment.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x370E001E")
+    except Exception:
+        return ""
+
+def extract_inline_images(email, output_dir=None):
+    """Save inline email images for OCR."""
+    if output_dir is None:
+        output_dir = Path.home() / "Downloads" / "survey_attachments" / "inline_images"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files = []
+    for index, attachment in enumerate(email["attachments"], start=1):
+        filename = str(getattr(attachment, "Filename", "") or "").strip()
+        suffix = Path(filename).suffix.lower()
+        mime_type = str(get_attachment_mime_type(attachment) or "").lower()
+        if suffix not in IMAGE_EXTENSIONS and not mime_type.startswith("image/"):
+            continue
+
+        if not suffix:
+            suffix = ".png"
+        safe_name = filename or f"inline_image_{index}{suffix}"
+        target = output_dir / safe_name
+        attachment.SaveAsFile(str(target))
+        saved_files.append(target)
+        print(f"    [OK] Saved inline image: {target.name}")
+
+    return saved_files
+
+def extract_site_contact_from_email(email):
+    """Extract site contact details from the email body or inline images."""
+    print("  Extracting site contact from email body...")
+
+    candidates = []
+    email_text = "\n".join(
+        part for part in [email.get("body", ""), email.get("html_body", "")]
+        if part
+    )
+    candidates.extend(extract_contact_candidates_from_text(email_text))
+
+    image_paths = extract_inline_images(email)
+    if not image_paths:
+        print("    [!] No inline email images found")
+    else:
+        for image_path in image_paths:
+            try:
+                text = pytesseract.image_to_string(Image.open(image_path))
+            except Exception as e:
+                print(f"    [ERROR] OCR failed for {image_path.name}: {e}")
+                continue
+
+            image_candidates = extract_contact_candidates_from_text(text)
+            if image_candidates:
+                print(f"    [OK] Found {len(image_candidates)} contact candidate(s) in {image_path.name}")
+                candidates.extend(image_candidates)
+
+    candidates = dedupe_contact_candidates(candidates)
+    if not candidates:
+        print("    [!] No site contact details found in email body images")
+        return None, None
+
+    print("    Contact candidates:")
+    for index, candidate in enumerate(candidates, start=1):
+        print(f"      [{index}] {candidate.get('name') or '[NO NAME]'} | {candidate.get('email') or '[NO EMAIL]'}")
+
+    if len(candidates) == 1:
+        chosen = candidates[0]
+        print(f"    [OK] Using single contact candidate: {chosen.get('name')} | {chosen.get('email')}")
+        return chosen.get("email"), chosen.get("name")
+
+    while True:
+        choice = prompt_text(
+            f"  Select site contact [1-{len(candidates)}]: ",
+            default="1",
+        )
+        if choice.isdigit():
+            index = int(choice)
+            if 1 <= index <= len(candidates):
+                chosen = candidates[index - 1]
+                print(f"    [OK] Selected: {chosen.get('name')} | {chosen.get('email')}")
+                return chosen.get("email"), chosen.get("name")
+        print("[INFO] Enter a valid contact number.")
 
 def detect_job_type(pdf_paths, fallback_subject=None):
     """Detect if job is ParkingEye or G24 based on PDF content or subject."""
@@ -280,25 +520,68 @@ def detect_job_type(pdf_paths, fallback_subject=None):
 # PRINTING
 # ============================================================================
 
+def get_default_printer():
+    """Return the Windows default printer name, if available."""
+    try:
+        return win32print.GetDefaultPrinter()
+    except Exception as e:
+        print(f"  [!] Could not read default printer: {e}")
+        return None
+
+def show_printer_status():
+    """Show printer configuration before attempting PDF prints."""
+    print("\n[PRINT DIAGNOSTICS]")
+    default_printer = get_default_printer()
+    if not default_printer:
+        print("  [ERROR] No default printer detected")
+        return None
+
+    print(f"  Default printer: {default_printer}")
+    try:
+        handle = win32print.OpenPrinter(default_printer)
+        try:
+            info = win32print.GetPrinter(handle, 2)
+        finally:
+            win32print.ClosePrinter(handle)
+
+        status = info.get("Status", 0)
+        attributes = info.get("Attributes", 0)
+        print(f"  Driver: {info.get('pDriverName')}")
+        print(f"  Port: {info.get('pPortName')}")
+        print(f"  Status code: {status}")
+        print(f"  Attributes: {attributes}")
+    except Exception as e:
+        print(f"  [!] Could not inspect printer details: {e}")
+
+    return default_printer
+
 def print_pdfs(pdf_paths):
     """Print PDF attachments."""
     print(f"\n[STEP 2] Printing {len(pdf_paths)} PDF(s)...")
-    
-    try:
-        import subprocess
-        for pdf in pdf_paths:
-            print(f"  Sending to printer: {pdf.name}")
-            try:
-                subprocess.run(['print', str(pdf)], check=True, capture_output=True)
-            except FileNotFoundError:
-                # print command might not exist, try alternative
-                print(f"    ! Print command not available, trying via Explorer...")
-                os.startfile(str(pdf), 'print')
-        print("[OK] PDFs sent to printer")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Error printing: {e}")
+
+    default_printer = show_printer_status()
+    if not default_printer:
         return False
+
+    all_sent = True
+    for pdf in pdf_paths:
+        print(f"  Sending to printer: {pdf.name}")
+        try:
+            win32api.ShellExecute(
+                0,
+                "printto",
+                str(pdf),
+                f'"{default_printer}"',
+                str(pdf.parent),
+                0,
+            )
+            time.sleep(2)
+            print(f"    [OK] Print command sent to {default_printer}")
+        except Exception as e:
+            all_sent = False
+            print(f"    [ERROR] Failed to print {pdf.name}: {e}")
+
+    return all_sent
 
 def print_sent_email_to_lewis(recipient_email):
     """Print the email that was sent TO Lewis (from Sent folder)."""
@@ -381,7 +664,7 @@ def update_project(project_number, address, po_number, site_contact_email, site_
     
     payload = {
         "clientOrderNumber": po_number,
-        "reportRecipientName1": site_contact_email,
+        "reportRecipientName1": site_contact_name,
         "reportRecipientEmailAddress1": site_contact_email,
     }
     
@@ -412,9 +695,13 @@ def generate_desktop_study(project_number):
 # EMAIL SENDING
 # ============================================================================
 
-def send_email_to_site_contact(recipient_email, recipient_name, job_number, address):
-    """Send dynamic email to site contact with job details."""
-    print(f"\n[STEP 6] Preparing email to site contact: {recipient_email}...")
+def prepare_email_to_site_contact(recipient_email, recipient_name, job_number, address):
+    """Prepare a draft email preview only; do not send automatically."""
+    if not recipient_email:
+        print("\n[STEP 6] Skipping email draft because no site contact email was found.")
+        return False
+
+    print(f"\n[STEP 6] Preparing email draft to site contact: {recipient_email}...")
     
     # TODO: Add dynamic template based on day of week
     # For now, placeholder template
@@ -439,11 +726,92 @@ Best regards,
 [Your Company]
 """
     
-    print(f"    [OK] Email prepared (not sent in beta mode)")
+    print(f"    [OK] Email drafted for manual review only")
     print(f"    Subject: {subject}")
     print(f"    To: {recipient_email}")
-    
+    print("    [MANUAL ACTION] Review and send this email yourself if appropriate")
+
     return True
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["test", "live", "debug"],
+        help="Run in local test mode, live Outlook mode, or debug folder-listing mode.",
+    )
+    parser.add_argument(
+        "--email-index",
+        type=int,
+        help="Select a recent inbox email by index when fallback email picking is needed.",
+    )
+    parser.add_argument(
+        "--proceed",
+        choices=["yes", "no"],
+        help="Answer the extracted-data confirmation prompt.",
+    )
+    parser.add_argument(
+        "--create-project",
+        choices=["yes", "no"],
+        help="Answer the Alpha Tracker create-project prompt.",
+    )
+    return parser.parse_args()
+
+def resolve_mode(args=None):
+    """Resolve runtime mode without depending on interactive stdin."""
+    args = args or parse_args()
+    if args.mode:
+        return args.mode
+
+    if not sys.stdin.isatty():
+        print("\n[INFO] No interactive stdin detected. Defaulting to test mode.")
+        return "test"
+
+    try:
+        return input(
+            "\nMode? Enter 'test' for mock data, 'debug' for Outlook folders, or press Enter for live Outlook: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n[INFO] Input unavailable. Defaulting to test mode.")
+        return "test"
+
+def prompt_text(message, default="", allowed=None):
+    """Prompt safely, falling back to defaults when stdin is unavailable."""
+    while True:
+        try:
+            value = input(message).strip().lower()
+        except EOFError:
+            print(f"{message}{default}")
+            return default
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted. Waiting for input...")
+            continue
+
+        if not value:
+            return default
+        if allowed and value not in allowed:
+            print(f"[INFO] Invalid input '{value}'. Enter one of: {', '.join(sorted(allowed))}")
+            continue
+        return value
+
+def prompt_required_text(message, current_value=None):
+    """Keep prompting until a non-empty value is supplied."""
+    prompt_suffix = f" [{current_value}]" if current_value else ""
+    while True:
+        try:
+            value = input(f"{message}{prompt_suffix}: ").strip()
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted. Waiting for input...")
+            continue
+        except EOFError:
+            value = current_value or ""
+
+        if value:
+            return value
+        if current_value:
+            return current_value
+        print("[INFO] This value is required.")
 
 # ============================================================================
 # MAIN WORKFLOW
@@ -455,13 +823,14 @@ def main():
     print("="*70)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # TEST MODE: Allow manual input if no emails found
-    test_mode = input("\nTest mode? Enter 'test' to use mock data, or press Enter to read Outlook: ").lower()
-    
-    if test_mode == 'debug':
+    args = parse_args()
+    mode = args.mode or resolve_mode(args)
+    is_test_mode = mode == 'test'
+
+    if mode == 'debug':
         list_outlook_folders()
         return
-    elif test_mode == 'test':
+    elif is_test_mode:
         print("\n[TEST MODE] Using mock data for development...")
         emails = [{
             "sender": "Lewis Dunkley",
@@ -471,12 +840,7 @@ def main():
             "attachments": [],
             "message_id": "TEST"
         }]
-        # Create mock PDF files for testing
-        mock_pdf = Path.home() / "Downloads" / "survey_attachments" / "test_survey.pdf"
-        mock_pdf.parent.mkdir(parents=True, exist_ok=True)
-        if not mock_pdf.exists():
-            mock_pdf.write_text("Mock PDF - test content\nParkingEye\n123 Main Street\nLondon\nE1 1AA")
-        emails[0]["attachments"] = [mock_pdf]
+        emails[0]["attachments"] = [BASE_DIR / "test_survey.pdf"]
     else:
         # STEP 1: Get email from Lewis - try a.smith account first
         emails = get_outlook_emails_from_lewis(account_name="a.smith")
@@ -501,16 +865,23 @@ def main():
                 
                 # In non-interactive mode, just use first non-system email
                 try:
-                    email_index = int(input("  Select email index (or press Enter to skip): ") or "-1")
+                    selected_index = args.email_index
+                    if selected_index is None:
+                        selected_index = int(
+                            prompt_text("  Select email index (or press Enter to skip): ", default="-1")
+                        )
+                    email_index = selected_index
                     if 0 <= email_index < len(recent_items):
                         item = recent_items[email_index]
                         emails = [{
                             "sender": item.SenderName,
                             "subject": item.Subject,
                             "body": item.Body,
+                            "html_body": getattr(item, "HTMLBody", ""),
                             "received_time": item.ReceivedTime,
                             "attachments": item.Attachments,
-                            "message_id": item.EntryID
+                            "message_id": item.EntryID,
+                            "outlook_item": item,
                         }]
                 except (ValueError, EOFError):
                     pass
@@ -531,7 +902,11 @@ def main():
         print(f"\n  [{idx+1}/{len(emails)}] Checking: {email['subject'][:60]}")
         
         # Check for attachments
-        if isinstance(email['attachments'], list) and isinstance(email['attachments'][0], Path):
+        if (
+            isinstance(email['attachments'], list)
+            and email['attachments']
+            and isinstance(email['attachments'][0], Path)
+        ):
             # Test mode - already has file paths
             pdf_files = email['attachments']
             selected_email = email
@@ -564,9 +939,26 @@ def main():
     print(f"\nUsing template job: {template_job}")
     
     # STEP 3: Extract data from PDFs and email
-    address = extract_address_from_pdf(pdf_files[0])
+    address = extract_address_from_pdfs(pdf_files)
     po_number = extract_po_number(email['body'])
-    site_contact_email, site_contact_name = extract_site_contact_from_image(pdf_files[0])
+    site_contact_email, site_contact_name = extract_site_contact_from_email(email)
+
+    if email.get("message_id") == "TEST":
+        address = address or "123 Main Street, London, E1 1AA"
+        site_contact_email = site_contact_email or "site.contact@example.com"
+        site_contact_name = site_contact_name or "Test Contact"
+
+    if not address or not UK_POSTCODE_RE.search(address):
+        print("\n[MANUAL CHECK] Address extraction needs help.")
+        address = prompt_required_text("Enter full site address including town and postcode", address)
+
+    if not site_contact_name:
+        print("\n[MANUAL CHECK] Site contact name is required.")
+        site_contact_name = prompt_required_text("Enter site contact name", site_contact_name)
+
+    if not site_contact_email:
+        print("\n[MANUAL CHECK] Site contact email is required.")
+        site_contact_email = prompt_required_text("Enter site contact email", site_contact_email)
     
     print("\n" + "="*70)
     print("EXTRACTED DATA SUMMARY")
@@ -580,21 +972,43 @@ def main():
     print("="*70)
     
     # USER CHECKPOINT
-    try:
-        confirm = input("\n[?] Proceed with this data? (yes/no): ").lower()
-    except EOFError:
-        confirm = "yes"  # Default to yes in non-interactive mode
+    confirm = args.proceed or prompt_text(
+        "\n[?] Proceed with this data? (yes/no): ",
+        default="yes",
+        allowed={"yes", "no"},
+    )
     
     if confirm != 'yes':
         print("[CANCELLED] Workflow cancelled by user.")
         return
     
     # STEP 4: Print documents
-    print_pdfs(pdf_files)
-    print_sent_email_to_lewis(site_contact_email or "N/A")
+    if is_test_mode:
+        print("\n[TEST MODE] Skipping printing and Sent Items lookup.")
+    else:
+        print_confirm = prompt_text(
+            "\n[?] Print the PDF attachments now? (yes/no): ",
+            default="no",
+            allowed={"yes", "no"},
+        )
+        if print_confirm == "yes":
+            print_pdfs(pdf_files)
+        else:
+            print("[INFO] Printing skipped by user.")
+        print_sent_email_to_lewis(site_contact_email or "N/A")
     
     # STEP 5: Get template project and prepare duplication
-    template_project = get_project(template_job)
+    if is_test_mode:
+        template_project = {
+            "projectLetter": "G",
+            "clientId": 1,
+            "clientProjectRef": "TEST-REF",
+            "siteId": 1,
+            "status": "New",
+            "projectTypeId": 1,
+        }
+    else:
+        template_project = get_project(template_job)
     if not template_project:
         print("[ERROR] Could not load template project. Exiting.")
         return
@@ -615,18 +1029,19 @@ def main():
     print("="*70)
     
     # USER CHECKPOINT
-    try:
-        confirm = input("\n[?] Create new project in Alpha Tracker? (yes/no): ").lower()
-    except EOFError:
-        confirm = "no"  # Default to no in non-interactive mode (stay safe)
+    confirm = args.create_project or prompt_text(
+        "\n[?] Create new project in Alpha Tracker? (yes/no): ",
+        default="no",
+        allowed={"yes", "no"},
+    )
     
     if confirm == 'yes':
         print("\n[BETA] BETA MODE: Live project creation is disabled.")
         print("   In production, the new project would be created here.")
     
     
-    # STEP 6: Send email to site contact
-    send_email_to_site_contact(site_contact_email, site_contact_name, template_job, address)
+    # STEP 6: Prepare email draft only
+    prepare_email_to_site_contact(site_contact_email, site_contact_name, template_job, address)
     
     # STEP 7: Generate desktop study
     generate_desktop_study(template_job)
