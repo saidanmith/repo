@@ -81,7 +81,6 @@ def ensure_runtime_dirs():
 
 def append_run_note(run_notes, message):
     """Record a run note for the end-of-run summary."""
-    print(message)
     run_notes.append(message)
 
 def split_address_and_postcode(address):
@@ -124,6 +123,22 @@ def write_run_summary(run_notes):
     log_path.write_text("\n".join(run_notes), encoding="utf-8")
     print(f"[LOG] Summary saved to {log_path}")
 
+def append_json_to_log(run_notes, title, payload):
+    """Append formatted JSON payload details to the log only."""
+    run_notes.append(title)
+    run_notes.append(json.dumps(payload, indent=2))
+
+def append_section_to_log(run_notes, title, lines):
+    """Append a titled multi-line section to the log only."""
+    run_notes.append(title)
+    run_notes.extend(lines)
+
+def show_project_number_banner(project_number):
+    """Print a highly visible new project number."""
+    print("\n" + "=" * 70)
+    print(f"NEW PROJECT NUMBER: {project_number}")
+    print("=" * 70)
+
 CREDS = load_credentials()
 API_URL = CREDS.get("API_URL", "https://manager.alphatracker.co.uk/api")
 API_KEY = CREDS.get("API_KEY")
@@ -147,9 +162,7 @@ def get_outlook_emails_from_lewis(account_name=None):
         outlook = win32com.client.Dispatch("Outlook.Application")
         namespace = outlook.GetNamespace("MAPI")
         
-        # Get all available accounts
         accounts = namespace.Accounts
-        print(f"  Available accounts: {[acc.DisplayName for acc in accounts]}")
         
         # Find the a.smith account
         a_smith_account = None
@@ -161,11 +174,7 @@ def get_outlook_emails_from_lewis(account_name=None):
         if not a_smith_account:
             a_smith_account = accounts[1] if len(accounts) > 1 else accounts[0]
         
-        print(f"  Using account: {a_smith_account.DisplayName}")
-        
-        # Get the root store folder for this account
         root_folder = namespace.Folders.Item(a_smith_account.DisplayName)
-        print(f"  Root folder: {root_folder.Name}")
         
         # Find Inbox subfolder
         inbox = None
@@ -178,20 +187,14 @@ def get_outlook_emails_from_lewis(account_name=None):
             print(f"  [ERROR] Could not find Inbox folder")
             return []
         
-        print(f"  Inbox found: {inbox.Items.Count} emails")
-        
-        # Search for Lewis emails with asbestos survey request subject
         emails = []
         search_terms = ["lewis", "dunkley", "l.dunkley"]
         target_email = "l.dunkley@greenshieldenvironmental.co.uk"
         
-        print(f"  Searching through all {inbox.Items.Count} emails...")
         item_count = 0
         
         for item in inbox.Items:
             item_count += 1
-            if item_count % 100 == 0:
-                print(f"    ... processed {item_count} emails...")
             
             try:
                 sender_name_lower = str(item.SenderName).lower()
@@ -259,16 +262,13 @@ def extract_attachments(email, output_dir=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"  Extracting attachments from: {email['subject']}...")
-    
     extracted_files = []
     for attachment in email['attachments']:
         if attachment.Filename.lower().endswith('.pdf'):
             filepath = output_dir / attachment.Filename
             attachment.SaveAsFile(str(filepath))
             extracted_files.append(filepath)
-            print(f"    [OK] Saved: {attachment.Filename}")
-    
+    print(f"  Saved {len(extracted_files)} PDF attachment(s)")
     return extracted_files
 
 # ============================================================================
@@ -309,15 +309,9 @@ def extract_address_from_pdf(pdf_path):
 
 def extract_po_number(email_body):
     """Extract PO number from email body (format: PO-xxxxxx)."""
-    print("  Extracting PO number from email...")
-    
     match = re.search(r'PO-(\d+)', email_body, re.IGNORECASE)
     if match:
-        po_number = match.group(1)
-        print(f"    [OK] Found PO: {po_number}")
-        return po_number
-    
-    print("    [!] No PO number found")
+        return match.group(1)
     return None
 
 def clean_address_line(line):
@@ -517,56 +511,37 @@ def extract_inline_images(email, output_dir=None):
         target = output_dir / safe_name
         attachment.SaveAsFile(str(target))
         saved_files.append(target)
-        print(f"    [OK] Saved inline image: {target.name}")
 
     return saved_files
 
 def extract_site_contact_from_email(email):
     """Extract site contact details from inline images in the email body."""
-    print("  Extracting site contact from email body...")
-
     candidates = []
     image_paths = extract_inline_images(email)
-    if not image_paths:
-        print("    [!] No inline email images found")
-    else:
+    if image_paths:
         for image_path in image_paths:
             try:
                 text = pytesseract.image_to_string(Image.open(image_path))
-            except Exception as e:
-                print(f"    [ERROR] OCR failed for {image_path.name}: {e}")
+            except Exception:
                 continue
 
             image_candidates = extract_contact_candidates_from_text(text)
             if image_candidates:
-                print(f"    [OK] Found {len(image_candidates)} contact candidate(s) in {image_path.name}")
                 candidates.extend(image_candidates)
 
     candidates = dedupe_contact_candidates(candidates)
-    if not candidates:
-        print("    [!] No site contact details found in email body images")
-        return []
-
-    selected = prompt_contact_candidates(candidates)
-    if selected:
-        return selected
-
-    return []
+    return prompt_contact_candidates(candidates) if candidates else []
 
 def detect_job_type(pdf_paths, fallback_subject=None):
     """Detect if job is ParkingEye or G24 based on PDF content or subject."""
-    print("  Detecting job type from PDFs...")
-    
     for pdf in pdf_paths:
         try:
             with pdfplumber.open(pdf) as pdf_file:
                 text = " ".join([page.extract_text() or "" for page in pdf_file.pages])
                 
                 if "parkingeye" in text.lower():
-                    print(f"    [OK] Detected: ParkingEye")
                     return "parkingeye"
                 elif "g24" in text.lower() or "G24" in text:
-                    print(f"    [OK] Detected: G24")
                     return "g24"
         except:
             pass
@@ -574,13 +549,9 @@ def detect_job_type(pdf_paths, fallback_subject=None):
     # Fallback to subject line detection
     if fallback_subject:
         if "parkingeye" in fallback_subject.lower():
-            print(f"    [OK] Detected from subject: ParkingEye")
             return "parkingeye"
         elif "g24" in fallback_subject.lower():
-            print(f"    [OK] Detected from subject: G24")
             return "g24"
-    
-    print("    ? Could not autodetect job type")
     return None
 
 # ============================================================================
@@ -742,6 +713,44 @@ def get_project(project_number):
         print(f"    [ERROR] Error fetching project: {e}")
         return None
 
+def create_site(site_payload):
+    """Create a new site in Alpha Tracker."""
+    print("\n[TRACKER] Creating site...")
+    try:
+        resp = requests.post(
+            f"{API_URL}/sites",
+            headers=API_HEADERS,
+            json=site_payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        site_id = data.get("siteId")
+        print(f"  [OK] Site created with siteId {site_id}")
+        return data
+    except Exception as e:
+        print(f"  [ERROR] Error creating site: {e}")
+        return None
+
+def create_project(project_payload):
+    """Create a new project in Alpha Tracker."""
+    print("\n[TRACKER] Creating project...")
+    try:
+        resp = requests.post(
+            f"{API_URL}/projects",
+            headers=API_HEADERS,
+            json=project_payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        project_number = data.get("projectNumber")
+        print(f"  [OK] Project created: {project_number}")
+        return data
+    except Exception as e:
+        print(f"  [ERROR] Error creating project: {e}")
+        return None
+
 def build_site_preview(template_project_data, full_address, postcode, contacts):
     """Build a preview payload for Alpha Tracker site creation."""
     primary_contact = contacts[0] if contacts else {}
@@ -759,35 +768,28 @@ def build_site_preview(template_project_data, full_address, postcode, contacts):
     }
     return site_payload
 
-def create_project_from_template(template_project_data, address_line, postcode, po_number, contacts):
-    """
-    Create a new project by duplicating template + inserting new data.
-    NOTE: In beta mode, this will only show preview data.
-    """
-    print(f"\n[STEP 4] Preparing new project (PREVIEW MODE)...")
-
-    primary_contact = contacts[0] if contacts else {}
-    
-    # Extract key fields from template
-    new_project = {
+def build_project_create_payload(template_project_data, site_id, po_number, contacts):
+    """Build a minimal project-create payload from the template."""
+    payload = {
         "projectLetter": template_project_data.get("projectLetter", "A"),
         "clientId": template_project_data.get("clientId"),
-        "clientOrderNumber": po_number,  # Insert PO number here (without "PO-" prefix)
-        "clientProjectRef": template_project_data.get("clientProjectRef"),
-        "siteId": template_project_data.get("siteId"),
-        "reportRecipientName1": primary_contact.get("name"),
-        "reportRecipientEmailAddress1": primary_contact.get("email"),
-        "status": template_project_data.get("status", "New"),
+        "clientOrderNumber": po_number,
+        "siteId": site_id,
         "projectTypeId": template_project_data.get("projectTypeId"),
     }
-    
-    print(f"    New project data prepared (not created yet):")
-    print(f"      - Address: {address_line[:50]}..." if address_line else "      - Address: [NONE]")
-    print(f"      - Postcode: {postcode}")
-    print(f"      - PO Number: {po_number}")
-    print(f"      - Site Contact: {primary_contact.get('email')}")
-    
-    return new_project
+
+    if template_project_data.get("status") is not None:
+        payload["status"] = template_project_data.get("status")
+
+    for index in range(1, 6):
+        name_key = f"reportRecipientName{index}"
+        email_key = f"reportRecipientEmailAddress{index}"
+        if template_project_data.get(name_key) or template_project_data.get(email_key):
+            contact = contacts[index - 1] if len(contacts) >= index else {}
+            payload[name_key] = contact.get("name")
+            payload[email_key] = contact.get("email")
+
+    return payload
 
 def update_project(project_number, address, po_number, site_contact_email, site_contact_name):
     """Update project with extracted data."""
@@ -1059,6 +1061,14 @@ def main():
         print("[ERROR] No emails found from Lewis Dunkley. Exiting.")
         write_run_summary(["No matching asbestos survey request emails found."])
         return
+    append_section_to_log(
+        run_notes,
+        "Matching emails:",
+        [
+            f"{index + 1}. {email.get('received_time')} | {email.get('subject')}"
+            for index, email in enumerate(emails)
+        ],
+    )
     
     # Try each Lewis email until we find one with PDF attachments
     selected_email = None
@@ -1097,6 +1107,16 @@ def main():
     email = selected_email
     print(f"\n[OK] Selected email: {email['subject']}")
     append_run_note(run_notes, f"Selected email: {email['subject']}")
+    append_section_to_log(
+        run_notes,
+        "Email details:",
+        [
+            f"Sender: {email.get('sender')}",
+            f"Sender email: {email.get('sender_email')}",
+            f"Received: {email.get('received_time')}",
+            f"Attachments saved: {len(pdf_files)}",
+        ],
+    )
 
     # STEP 2: Detect job type
     job_type = detect_job_type(pdf_files, fallback_subject=email['subject'])
@@ -1115,6 +1135,11 @@ def main():
     address = extract_address_from_pdfs(pdf_files)
     po_number = extract_po_number(email['body'])
     contacts = extract_site_contact_from_email(email)
+    append_section_to_log(
+        run_notes,
+        "Attachment files:",
+        [str(pdf_path) for pdf_path in pdf_files],
+    )
 
     if email.get("message_id") == "TEST":
         address = address or "123 Main Street, London, E1 1AA"
@@ -1139,18 +1164,27 @@ def main():
     address_line, postcode = split_address_and_postcode(address)
     tracker_address = sanitize_address_for_tracker(address_line)
     tracker_postcode = sanitize_address_for_tracker(postcode) if postcode else None
+    append_section_to_log(
+        run_notes,
+        "Extraction details:",
+        [
+            f"Raw address: {address}",
+            f"Address line: {address_line}",
+            f"Postcode: {postcode}",
+            f"Tracker address: {tracker_address}",
+            f"Tracker postcode: {tracker_postcode}",
+            f"PO number: {po_number}",
+        ],
+    )
+    append_json_to_log(run_notes, "Contact details:", contacts)
     
     print("\n" + "="*70)
-    print("EXTRACTED DATA SUMMARY")
+    print("SUMMARY")
     print("="*70)
-    print(f"Job Type: {job_type.upper()}")
-    print(f"Template Job: {template_job}")
+    print(f"Job: {job_type.upper()} | Template: {template_job}")
+    print(f"PO: {po_number or '[NOT FOUND]'}")
     print(f"Address: {address or '[NOT EXTRACTED]'}")
-    print(f"Tracker Address: {tracker_address or '[NOT EXTRACTED]'}")
-    print(f"Tracker Postcode: {tracker_postcode or '[NOT EXTRACTED]'}")
-    print(f"PO Number: {po_number or '[NOT FOUND]'}")
-    for index, contact in enumerate(contacts, start=1):
-        print(f"Site Contact {index}: {contact.get('name') or '[NOT EXTRACTED]'} | {contact.get('email') or '[NOT EXTRACTED]'}")
+    print(f"Contacts found: {len(contacts)}")
     print("="*70)
     append_run_note(run_notes, f"Address: {address}")
     append_run_note(run_notes, f"Contacts: {json.dumps(contacts)}")
@@ -1162,6 +1196,7 @@ def main():
             default="no",
             allowed={"yes", "no"},
         )
+        append_run_note(run_notes, f"Test print requested: {print_confirm}")
         if print_confirm == "yes":
             print_result = print_pdfs(pdf_files, first_page_only=True)
             append_run_note(run_notes, f"Test print result: {'success' if print_result else 'manual fallback or failed'}")
@@ -1173,6 +1208,7 @@ def main():
             default="no",
             allowed={"yes", "no"},
         )
+        append_run_note(run_notes, f"Print requested: {print_confirm}")
         if print_confirm == "yes":
             print_result = print_pdfs(pdf_files)
             append_run_note(run_notes, f"Print result: {'success' if print_result else 'manual fallback or failed'}")
@@ -1198,26 +1234,81 @@ def main():
         write_run_summary(run_notes)
         return
     
-    new_project_data = create_project_from_template(
+    site_preview = build_site_preview(template_project, address, tracker_postcode, contacts)
+    project_create_payload = build_project_create_payload(
         template_project,
-        tracker_address,
-        tracker_postcode,
+        "<new siteId from POST /sites>",
         po_number,
         contacts,
     )
-    site_preview = build_site_preview(template_project, address, tracker_postcode, contacts)
     
     print("\n" + "="*70)
-    print("READY TO CREATE NEW PROJECT (BETA - NOT LIVE YET)")
+    print("TRACKER PREVIEW")
     print("="*70)
     print(f"Template: {template_job}")
-    print(f"New Project Data:\n{json.dumps(new_project_data, indent=2)}")
-    print("\nSuggested site-create payload for POST /sites:")
-    print(json.dumps(site_preview, indent=2))
+    print(f"Site: {site_preview.get('siteName')} | {site_preview.get('sitePostcode')}")
+    print(f"PO: {project_create_payload.get('clientOrderNumber')} | Project Type: {project_create_payload.get('projectTypeId')}")
     print("="*70)
     append_run_note(run_notes, f"Template project loaded: {template_job}")
+    append_json_to_log(run_notes, "Suggested site-create payload for POST /sites:", site_preview)
+    append_json_to_log(run_notes, "Suggested project-create payload for POST /projects:", project_create_payload)
 
-    print("\n[BETA] Live Alpha Tracker create/update remains disabled.")
+    create_site_confirm = prompt_text(
+        "\n[?] Create this site in Alpha Tracker now? (yes/no): ",
+        default="no",
+        allowed={"yes", "no"},
+    )
+    append_run_note(run_notes, f"Create site confirmation: {create_site_confirm}")
+    if create_site_confirm == "yes":
+        site_result = create_site(site_preview)
+        if not site_result or not site_result.get("siteId"):
+            append_run_note(run_notes, "Site creation failed.")
+            write_run_summary(run_notes)
+            return
+        new_site_id = site_result.get("siteId")
+        append_run_note(run_notes, f"Created siteId: {new_site_id}")
+        append_json_to_log(run_notes, "Site creation response:", site_result)
+    else:
+        append_run_note(run_notes, "Site creation skipped by user.")
+        write_run_summary(run_notes)
+        return
+
+    project_create_payload = build_project_create_payload(
+        template_project,
+        new_site_id,
+        po_number,
+        contacts,
+    )
+    append_json_to_log(run_notes, "Final project-create payload for POST /projects:", project_create_payload)
+
+    print("\n" + "="*70)
+    print("TRACKER PROJECT CREATE")
+    print("="*70)
+    print(f"Using new siteId: {new_site_id}")
+    print(f"Project letter: {project_create_payload.get('projectLetter')}")
+    print(f"PO Number: {project_create_payload.get('clientOrderNumber')}")
+    print("="*70)
+
+    create_project_confirm = prompt_text(
+        "\n[?] Create this project in Alpha Tracker now? (yes/no): ",
+        default="no",
+        allowed={"yes", "no"},
+    )
+    append_run_note(run_notes, f"Create project confirmation: {create_project_confirm}")
+    if create_project_confirm == "yes":
+        project_result = create_project(project_create_payload)
+        if not project_result or not project_result.get("projectNumber"):
+            append_run_note(run_notes, "Project creation failed.")
+            write_run_summary(run_notes)
+            return
+        new_project_number = project_result.get("projectNumber")
+        append_run_note(run_notes, f"Created projectNumber: {new_project_number}")
+        append_json_to_log(run_notes, "Project creation response:", project_result)
+        show_project_number_banner(new_project_number)
+    else:
+        append_run_note(run_notes, "Project creation skipped by user.")
+        write_run_summary(run_notes)
+        return
     
     
     # STEP 6: Prepare email draft only
