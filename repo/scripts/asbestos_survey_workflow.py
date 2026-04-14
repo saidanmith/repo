@@ -103,12 +103,12 @@ def sanitize_address_for_tracker(address):
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
-def split_site_name_and_address(address_line):
+def split_site_name_and_address(address_text):
     """Split the first line from the remaining address lines."""
-    if not address_line:
+    if not address_text:
         return None, None
 
-    parts = [part.strip() for part in address_line.split(",") if part.strip()]
+    parts = [part.strip() for part in address_text.split(",") if part.strip()]
     if not parts:
         return None, None
 
@@ -214,6 +214,7 @@ def get_outlook_emails_from_lewis(account_name=None):
                         "received_time": item.ReceivedTime,
                         "attachments": item.Attachments,
                         "message_id": item.EntryID,
+                        "store_id": item.Parent.StoreID,
                         "outlook_item": item,
                     })
             except:
@@ -483,25 +484,10 @@ def prompt_contact_candidates(candidates):
     """Let the user confirm which contact candidates to use."""
     if not candidates:
         return []
-
     print("    Contact candidates:")
     for index, candidate in enumerate(candidates, start=1):
         print(f"      [{index}] {candidate.get('name') or '[NO NAME]'} | {candidate.get('email') or '[NO EMAIL]'}")
-
-    if len(candidates) == 1:
-        confirm = prompt_text(
-            "  Use this contact? (yes/no): ",
-            default="yes",
-            allowed={"yes", "no"},
-        )
-        return candidates if confirm == "yes" else []
-
-    confirm = prompt_text(
-        "  Use all detected contacts in the draft email? (yes/no): ",
-        default="yes",
-        allowed={"yes", "no"},
-    )
-    return candidates if confirm == "yes" else []
+    return candidates
 
 def get_attachment_mime_type(attachment):
     """Read an Outlook attachment MIME type when available."""
@@ -756,10 +742,10 @@ def get_project(project_number):
         print(f"    [ERROR] Error fetching project: {e}")
         return None
 
-def build_site_preview(template_project_data, address_line, postcode, contacts):
+def build_site_preview(template_project_data, full_address, postcode, contacts):
     """Build a preview payload for Alpha Tracker site creation."""
     primary_contact = contacts[0] if contacts else {}
-    site_name, site_address = split_site_name_and_address(address_line)
+    site_name, site_address = split_site_name_and_address(full_address)
     site_payload = {
         "clientId": template_project_data.get("clientId"),
         "siteName": site_name,
@@ -840,8 +826,57 @@ def generate_desktop_study(project_number):
 # EMAIL SENDING
 # ============================================================================
 
-def prepare_email_to_site_contact(contacts, job_number, address):
-    """Create an Outlook draft only; do not send automatically."""
+def get_time_of_day_greeting():
+    """Return a greeting based on the current time."""
+    hour = datetime.now().hour
+    if hour < 12:
+        return "Good morning"
+    if hour < 18:
+        return "Good afternoon"
+    return "Good evening"
+
+def html_escape(value):
+    """Escape text for HTML insertion."""
+    value = value or ""
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+def build_site_contact_email_intro(recipient_name, client_label, visit_text):
+    """Build the intro text inserted above the forwarded email."""
+    greeting = get_time_of_day_greeting()
+    recipient_name = recipient_name or "there"
+    return (
+        f"{greeting}, {recipient_name},\n\n"
+        f"I have been provided your contact details by {client_label}, in regards to booking in a small targeted "
+        "asbestos survey for the above-named premises, prior to their installation works.\n\n"
+        "The survey is predominately external so will not cause any disruption to any on-site members of staff "
+        f"or guests, and should only take around 30-40 minutes. Would it be possible to send a surveyor {visit_text} "
+        "to undertake the survey please?\n\n"
+        "Any issues please do not hesitate to contact myself on the details below.\n\n"
+    )
+
+def build_site_contact_email_intro_html(recipient_name, client_label, visit_text):
+    """Build HTML intro inserted above the forwarded email."""
+    greeting = html_escape(get_time_of_day_greeting())
+    recipient_name = html_escape(recipient_name or "there")
+    client_label = html_escape(client_label)
+    visit_text = html_escape(visit_text)
+    return (
+        f"<p>{greeting}, {recipient_name},</p>"
+        f"<p>I have been provided your contact details by {client_label}, in regards to booking in a small targeted "
+        "asbestos survey for the above-named premises, prior to their installation works.</p>"
+        "<p>The survey is predominately external so will not cause any disruption to any on-site members of staff "
+        f"or guests, and should only take around 30-40 minutes. Would it be possible to send a surveyor {visit_text} "
+        "to undertake the survey please?</p>"
+        "<p>Any issues please do not hesitate to contact myself on the details below.</p>"
+    )
+
+def prepare_email_to_site_contact(source_email, contacts, job_type):
+    """Create an Outlook forward draft only; do not send automatically."""
     valid_contacts = [contact for contact in contacts if contact.get("email")]
     if not valid_contacts:
         print("\n[STEP 6] Skipping email draft because no site contact email was found.")
@@ -851,43 +886,48 @@ def prepare_email_to_site_contact(contacts, job_number, address):
     cc_contacts = valid_contacts[1:]
     recipient_email = primary_contact["email"]
     recipient_name = primary_contact.get("name") or "Site Contact"
+    client_label = "Parkingeye" if job_type == "parkingeye" else "G24"
+    visit_text = prompt_required_text(
+        "Enter the proposed visit wording",
+        "this coming Tuesday",
+    )
 
     print(f"\n[STEP 6] Preparing Outlook draft to site contact: {recipient_email}...")
     
-    # TODO: Add dynamic template based on day of week
-    # For now, placeholder template
-    day_of_week = datetime.now().strftime("%A")
-    
-    subject = f"Asbestos Survey - Job {job_number}"
-    
-    body = f"""
-Dear {recipient_name},
-
-Your asbestos survey has been scheduled.
-
-Job Number: {job_number}
-Address: {address}
-Day: {day_of_week}
-
-[DYNAMIC CONTENT BASED ON {day_of_week}]
-
-Please let us know if you have any questions.
-
-Best regards,
-[Your Company]
-"""
-    
     try:
+        if source_email.get("message_id") == "TEST":
+            print("    [ERROR] Could not create forward draft in test mode.")
+            return False
+
         outlook = win32com.client.Dispatch("Outlook.Application")
-        draft = outlook.CreateItem(0)
-        draft.Subject = subject
-        draft.Body = body
+        namespace = outlook.GetNamespace("MAPI")
+        message_id = source_email.get("message_id")
+        store_id = source_email.get("store_id")
+        source_item = namespace.GetItemFromID(message_id, store_id) if store_id else namespace.GetItemFromID(message_id)
+        if source_item is None:
+            print("    [ERROR] Could not create forward draft because the source Outlook email is unavailable.")
+            return False
+
+        try:
+            draft = source_item.Forward()
+        except Exception:
+            msg_copy_path = TEMP_DIR / f"{message_id}.msg"
+            source_item.SaveAs(str(msg_copy_path), 3)
+            reopened_item = namespace.OpenSharedItem(str(msg_copy_path))
+            draft = reopened_item.Forward()
         draft.To = recipient_email
         draft.CC = "; ".join(contact["email"] for contact in cc_contacts if contact.get("email"))
+        intro_html = build_site_contact_email_intro_html(recipient_name, client_label, visit_text)
+        existing_html = draft.HTMLBody
+        if existing_html:
+            draft.HTMLBody = intro_html + existing_html
+        else:
+            intro_text = build_site_contact_email_intro(recipient_name, client_label, visit_text)
+            draft.Body = intro_text + draft.Body
         draft.Save()
         draft.Display()
         print(f"    [OK] Outlook draft opened for manual review")
-        print(f"    Subject: {subject}")
+        print(f"    Subject: {draft.Subject}")
         print(f"    To: {draft.To}")
         print(f"    CC: {draft.CC}")
         print("    [MANUAL ACTION] Review and send this email yourself if appropriate")
@@ -1058,16 +1098,6 @@ def main():
     print(f"\n[OK] Selected email: {email['subject']}")
     append_run_note(run_notes, f"Selected email: {email['subject']}")
 
-    email_confirm = prompt_text(
-        "\n[?] Continue with this email? (yes/no): ",
-        default="yes",
-        allowed={"yes", "no"},
-    )
-    if email_confirm != "yes":
-        append_run_note(run_notes, "Stopped after email selection.")
-        write_run_summary(run_notes)
-        return
-    
     # STEP 2: Detect job type
     job_type = detect_job_type(pdf_files, fallback_subject=email['subject'])
     if not job_type:
@@ -1093,14 +1123,6 @@ def main():
     if not address or not UK_POSTCODE_RE.search(address):
         print("\n[MANUAL CHECK] Address extraction needs help.")
         address = prompt_required_text("Enter full site address including town and postcode", address)
-
-    address_confirm = prompt_text(
-        f"\n[?] Confirm extracted address '{address}'? (yes/no): ",
-        default="yes",
-        allowed={"yes", "no"},
-    )
-    if address_confirm != "yes":
-        address = prompt_required_text("Enter corrected full site address including town and postcode", address)
 
     if not contacts:
         print("\n[MANUAL CHECK] Site contact details are required.")
@@ -1132,19 +1154,6 @@ def main():
     print("="*70)
     append_run_note(run_notes, f"Address: {address}")
     append_run_note(run_notes, f"Contacts: {json.dumps(contacts)}")
-    
-    # USER CHECKPOINT
-    confirm = args.proceed or prompt_text(
-        "\n[?] Proceed with this data? (yes/no): ",
-        default="yes",
-        allowed={"yes", "no"},
-    )
-    
-    if confirm != 'yes':
-        print("[CANCELLED] Workflow cancelled by user.")
-        append_run_note(run_notes, "Cancelled at extraction summary.")
-        write_run_summary(run_notes)
-        return
     
     # STEP 4: Print documents
     if is_test_mode:
@@ -1196,7 +1205,7 @@ def main():
         po_number,
         contacts,
     )
-    site_preview = build_site_preview(template_project, tracker_address, tracker_postcode, contacts)
+    site_preview = build_site_preview(template_project, address, tracker_postcode, contacts)
     
     print("\n" + "="*70)
     print("READY TO CREATE NEW PROJECT (BETA - NOT LIVE YET)")
@@ -1207,33 +1216,13 @@ def main():
     print(json.dumps(site_preview, indent=2))
     print("="*70)
     append_run_note(run_notes, f"Template project loaded: {template_job}")
-    
-    # USER CHECKPOINT
-    confirm = args.create_project or prompt_text(
-        "\n[?] Continue past Alpha Tracker preview? (yes/no): ",
-        default="no",
-        allowed={"yes", "no"},
-    )
-    
-    if confirm != 'yes':
-        append_run_note(run_notes, "Stopped at Alpha Tracker preview.")
-        write_run_summary(run_notes)
-        return
-    
+
     print("\n[BETA] Live Alpha Tracker create/update remains disabled.")
     
     
     # STEP 6: Prepare email draft only
-    draft_confirm = prompt_text(
-        "\n[?] Create Outlook draft for site contacts now? (yes/no): ",
-        default="yes",
-        allowed={"yes", "no"},
-    )
-    if draft_confirm == "yes":
-        draft_result = prepare_email_to_site_contact(contacts, template_job, address)
-        append_run_note(run_notes, f"Draft email result: {'created' if draft_result else 'not created'}")
-    else:
-        append_run_note(run_notes, "Draft email skipped by user.")
+    draft_result = prepare_email_to_site_contact(email, contacts, job_type)
+    append_run_note(run_notes, f"Draft email result: {'created' if draft_result else 'not created'}")
     
     # STEP 7: Generate desktop study
     generate_desktop_study(template_job)
