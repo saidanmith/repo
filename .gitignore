@@ -1,0 +1,9 @@
+# Created by venv
+.venv/
+venv/
+credentials.txt
+temp/
+log/
+__pycache__/
+*.pyc
+.env
