@@ -59,7 +59,7 @@ UK_POSTCODE_RE = re.compile(
     r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
     re.IGNORECASE,
 )
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 def load_credentials():
     """Load API credentials from file."""
