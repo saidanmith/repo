@@ -1,0 +1,6 @@
+temp/
+.venv/
+accreditations/
+Excels/
+*.pdf
+*.xlsx
