@@ -4,6 +4,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLabel, QTextEdit, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from datetime import datetime
+import pythoncom
 
 # Import the logic you already built
 import email_logic 
@@ -14,11 +15,51 @@ class FetchEmailsThread(QThread):
     error = pyqtSignal(str)
 
     def run(self):
+        pythoncom.CoInitialize()
         try:
             emails = email_logic.get_lewis_emails()
             self.finished.emit(emails)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            pythoncom.CoUninitialize()
+
+class AnalyzeEmailThread(QThread):
+    """Handles slow OCR and PDF parsing in the background."""
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, email_dict, parent=None):
+        super().__init__(parent)
+        self.email_dict = email_dict
+
+    def run(self):
+        pythoncom.CoInitialize()
+        try:
+            # Fetch a thread-local MailItem for processing
+            item = email_logic.get_mail_item(self.email_dict['message_id'], self.email_dict.get('store_id'))
+            if not item:
+                raise Exception("Could not re-fetch email for background processing.")
+
+            # 1. Extract PDFs & Detect Job (passing raw item)
+            pdfs = email_logic.extract_pdf_attachments(item)
+            job = email_logic.detect_job_type(pdfs, self.email_dict['subject'])
+            client = "Parkingeye" if job == "parkingeye" else "G24"
+            
+            address = email_logic.extract_address_from_pdfs(pdfs)
+            
+            # 2. Extract Site Contacts via OCR (passing raw item)
+            candidates = email_logic.extract_site_contact(item)
+            
+            self.finished.emit({
+                "client": client,
+                "candidates": candidates,
+                "address": address
+            })
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            pythoncom.CoUninitialize()
 
 class AsbestosBotApp(QMainWindow):
     def __init__(self):
@@ -29,6 +70,8 @@ class AsbestosBotApp(QMainWindow):
         self.all_emails = []
         self.current_email = None
         self.client_label = "Parkingeye"
+        self.fetch_thread = None
+        self.analysis_thread = None
 
         self.init_ui()
         self.refresh_inbox()
@@ -61,6 +104,9 @@ class AsbestosBotApp(QMainWindow):
 
         self.name_input = QLineEdit()
         self.email_input = QLineEdit()
+        self.address_input = QLineEdit()
+        self.address_input.textChanged.connect(self.update_preview)
+        
         self.date_input = QLineEdit()
         self.date_input.setPlaceholderText("dd/mm/yyyy")
         self.date_input.textChanged.connect(self.update_preview)
@@ -69,6 +115,8 @@ class AsbestosBotApp(QMainWindow):
         form_layout.addWidget(self.name_input)
         form_layout.addWidget(QLabel("Site Contact Email:"))
         form_layout.addWidget(self.email_input)
+        form_layout.addWidget(QLabel("Site Address:"))
+        form_layout.addWidget(self.address_input)
         form_layout.addWidget(QLabel("Proposed Visit Date:"))
         form_layout.addWidget(self.date_input)
 
@@ -104,10 +152,10 @@ class AsbestosBotApp(QMainWindow):
     def refresh_inbox(self):
         self.inbox_list.clear()
         self.inbox_list.addItem("Fetching emails from Outlook...")
-        self.thread = FetchEmailsThread()
-        self.thread.finished.connect(self.on_emails_fetched)
-        self.thread.error.connect(lambda err: QMessageBox.critical(self, "Error", err))
-        self.thread.start()
+        self.fetch_thread = FetchEmailsThread(self)
+        self.fetch_thread.finished.connect(self.on_emails_fetched)
+        self.fetch_thread.error.connect(lambda err: QMessageBox.critical(self, "Error", err))
+        self.fetch_thread.start()
 
     def on_emails_fetched(self, emails):
         self.inbox_list.clear()
@@ -124,28 +172,30 @@ class AsbestosBotApp(QMainWindow):
         if idx < 0 or idx >= len(self.all_emails): return
         
         self.current_email = self.all_emails[idx]
+        self.preview_box.setText("<i>Analyzing email contents...</i>")
         
-        # Use your OCR logic
-        print("[INFO] Running OCR on attachments...")
-        pdfs = email_logic.extract_pdf_attachments(self.current_email)
-        job = email_logic.detect_job_type(pdfs, self.current_email['subject'])
-        self.client_label = "Parkingeye" if job == "parkingeye" else "G24"
-        
-        candidates = email_logic.extract_site_contact(self.current_email)
-        
+        # Start background analysis
+        self.analysis_thread = AnalyzeEmailThread(self.current_email, self)
+        self.analysis_thread.finished.connect(self.on_analysis_finished)
+        self.analysis_thread.error.connect(lambda err: QMessageBox.warning(self, "Analysis Error", err))
+        self.analysis_thread.start()
+
+    def on_analysis_finished(self, results):
+        self.client_label = results["client"]
+        candidates = results["candidates"]
+        self.address_input.setText(results.get("address") or "")
+
         if candidates:
             self.name_input.setText(candidates[0].get('name') or "")
             self.email_input.setText(candidates[0].get('email') or "")
-        else:
-            self.name_input.clear()
-            self.email_input.clear()
-
+            
         self.update_preview()
 
     def update_preview(self):
         if not self.current_email: return
         
         name = self.name_input.text() or "[Name]"
+        address = self.address_input.text() or "[Site Address]"
         date_str = self.date_input.text()
         
         try:
@@ -153,7 +203,7 @@ class AsbestosBotApp(QMainWindow):
         except:
             day_name, formatted_date = "[Day]", "[Date]"
 
-        body = email_logic.build_email_body(name, self.client_label, day_name, formatted_date)
+        body = email_logic.build_email_body(name, self.client_label, address, day_name, formatted_date)
         self.preview_box.setText(body)
 
     def open_draft(self):
@@ -161,15 +211,15 @@ class AsbestosBotApp(QMainWindow):
         
         name = self.name_input.text()
         to_email = self.email_input.text()
+        address = self.address_input.text()
         date_str = self.date_input.text()
         
         try:
             day_name, formatted_date = email_logic.parse_visit_date(date_str)
-            plain_body = email_logic.build_email_body(name, self.client_label, day_name, formatted_date)
-            html_intro = email_logic.build_email_body_html(name, self.client_label, day_name, formatted_date)
+            html_body = email_logic.build_email_body_html(name, self.client_label, address, day_name, formatted_date)
             subject = f"Asbestos Survey Booking - {formatted_date}"
             
-            email_logic.open_forward_draft(self.current_email, to_email, subject, plain_body, html_intro)
+            email_logic.open_new_draft(to_email, subject, html_body)
         except Exception as e:
             QMessageBox.warning(self, "Input Error", str(e))
 

@@ -32,6 +32,11 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 EMAIL_SUBJECT_FILTER = "asbestos survey request"
 IMAGE_EXTENSIONS     = {".png", ".jpg", ".jpeg"}
 
+UK_POSTCODE_RE = re.compile(
+    r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
+    re.IGNORECASE,
+)
+
 # ============================================================================
 # SENT LOG
 # ============================================================================
@@ -58,6 +63,19 @@ def save_sent_log(sent_ids):
 # ============================================================================
 # EMAIL FETCHING
 # ============================================================================
+
+def get_mail_item(message_id, store_id=None):
+    """Fetches a fresh MailItem from Outlook (required for background threads)."""
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        if store_id:
+            return namespace.GetItemFromID(message_id, store_id)
+        return namespace.GetItemFromID(message_id)
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch mail item: {e}")
+        return None
+
 
 def get_lewis_emails():
     """Fetch unhandled asbestos survey request emails from Lewis Dunkley."""
@@ -91,7 +109,9 @@ def get_lewis_emails():
         search_terms = ["lewis", "dunkley", "l.dunkley"]
         target_email = "l.dunkley@greenshieldenvironmental.co.uk"
 
-        for item in inbox.Items:
+        items = inbox.Items
+        for i in range(1, items.Count + 1):
+            item = items.Item(i)
             try:
                 sender_name  = str(item.SenderName).lower()
                 sender_email = str(getattr(item, "SenderEmailAddress", "")).lower()
@@ -128,20 +148,11 @@ def get_lewis_emails():
 # JOB TYPE DETECTION
 # ============================================================================
 
-def extract_pdf_attachments(email):
-    output_dir = TEMP_DIR / "pdfs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    files = []
-    for att in email["attachments"]:
-        if att.Filename.lower().endswith(".pdf"):
-            dest = output_dir / att.Filename
-            att.SaveAsFile(str(dest))
-            files.append(dest)
-    return files
-
-
 def detect_job_type(pdf_paths, fallback_subject=None):
-    for pdf in pdf_paths:
+    """Parses PDF text or subject line to determine client."""
+    for pdf_path in pdf_paths:
+        pdf = Path(pdf_path)
+        if not pdf.exists(): continue
         try:
             with pdfplumber.open(pdf) as f:
                 text = " ".join(page.extract_text() or "" for page in f.pages)
@@ -173,29 +184,73 @@ def get_attachment_mime_type(attachment):
         return ""
 
 
-def extract_inline_images(email):
+def extract_pdf_attachments(email_item):
+    """Saves PDF attachments from the raw Outlook MailItem."""
+    pdf_paths = []
+    pdf_dir = TEMP_DIR / "pdfs"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        attachments = email_item.Attachments
+        for i in range(1, attachments.Count + 1):
+            att = attachments.Item(i)
+            filename = str(getattr(att, "FileName", "") or "").strip()
+            if filename.lower().endswith(".pdf"):
+                dest = pdf_dir / filename
+                att.SaveAsFile(str(dest))
+                pdf_paths.append(dest)
+    except Exception as e:
+        print(f"  [ERROR] Failed to extract PDFs: {e}")
+    return pdf_paths
+
+
+def extract_address_from_pdfs(pdf_paths):
+    """Attempts to find a site address and postcode within the provided PDFs."""
+    for pdf_path in pdf_paths:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                # Usually, the address is on the first page of signage plans or instructions
+                text = pdf.pages[0].extract_text() or ""
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                
+                for i, line in enumerate(lines):
+                    if UK_POSTCODE_RE.search(line):
+                        # Capture the postcode line and the 1-2 lines preceding it
+                        start = max(0, i - 2)
+                        address_block = lines[start : i + 1]
+                        return ", ".join(address_block)
+        except Exception as e:
+            print(f"  [DEBUG] Address extraction error on {pdf_path.name}: {e}")
+    return ""
+
+
+def extract_inline_images(email_item):
+    """Saves image attachments from the raw Outlook MailItem."""
     output_dir = TEMP_DIR / "inline_images"
-    # Clear stale images from previous runs
     if output_dir.exists():
         for old_file in output_dir.iterdir():
-            try:
-                old_file.unlink()
-            except Exception:
-                pass
+            try: old_file.unlink() 
+            except Exception: pass
+
     output_dir.mkdir(parents=True, exist_ok=True)
     saved = []
-    for i, att in enumerate(email["attachments"], start=1):
-        filename  = str(getattr(att, "Filename", "") or "").strip()
-        suffix    = Path(filename).suffix.lower()
-        mime_type = str(get_attachment_mime_type(att) or "").lower()
-        if suffix not in IMAGE_EXTENSIONS and not mime_type.startswith("image/"):
-            continue
-        if not suffix:
-            suffix = ".png"
-        safe_name = filename or f"inline_image_{i}{suffix}"
-        dest = output_dir / safe_name
-        att.SaveAsFile(str(dest))
-        saved.append(dest)
+    try:
+        attachments = email_item.Attachments
+        for i in range(1, attachments.Count + 1):
+            att = attachments.Item(i)
+            filename = str(getattr(att, "FileName", "") or "").strip()
+            suffix = Path(filename).suffix.lower()
+            mime_type = str(get_attachment_mime_type(att) or "").lower()
+            
+            if suffix not in IMAGE_EXTENSIONS and not mime_type.startswith("image/"):
+                continue
+            
+            safe_name = filename or f"inline_image_{i}{suffix or '.png'}"
+            dest = output_dir / safe_name
+            att.SaveAsFile(str(dest))
+            saved.append(dest)
+    except Exception as e:
+        print(f"  [ERROR] Failed to extract images: {e}")
     return saved
 
 
@@ -214,10 +269,9 @@ def normalize_contact_name(name):
 def normalize_contact_email(email):
     if not email:
         return None
-    # Remove all whitespace and pipe characters (OCR table border artefacts)
-    email = re.sub(r"[\s|]", "", email)
+    # Remove whitespace and common OCR artefacts like pipes or slashes
+    email = re.sub(r"[\s|\\/]", "", email)
     email = email.strip(" ,.;:").replace("..", ".")
-    # Strip any leading punctuation OCR artefacts
     email = re.sub(r"^[^a-zA-Z0-9]+", "", email)
     return email.lower() or None
 
@@ -230,43 +284,35 @@ def extract_contact_candidates_from_text(text):
     current_name = None
 
     for line in lines:
-        name_match = re.search(r"^Name\b[:\s]+(.+)", line, re.IGNORECASE)
+        # Broaden matches to handle leading OCR noise (like '| Name:')
+        name_match = re.search(r"Name\b[:\s]+(.+)", line, re.IGNORECASE)
         if name_match:
             current_name = normalize_contact_name(name_match.group(1))
             continue
-        # Match "Email Address:", "Email Address", "Email:", "Email" followed by content
-        email_label_match = re.search(r"^Email(?:\s*Address)?\b[:\s]+(.+)", line, re.IGNORECASE)
+            
+        email_label_match = re.search(r"Email(?:\s*Address)?\b[:\s]+(.+)", line, re.IGNORECASE)
         if email_label_match:
-            raw = email_label_match.group(1)
-            email_in_raw = re.search(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", re.sub(r"\s+", "", raw))
-            if email_in_raw:
-                candidates.append({
-                    "name":  current_name,
-                    "email": normalize_contact_email(email_in_raw.group(1)),
-                })
+            email_match = re.search(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", email_label_match.group(1))
+            if email_match:
+                candidates.append({"name": current_name, "email": normalize_contact_email(email_match.group(1))})
                 current_name = None
             continue
-        # Catch bare email addresses on their own line (fallback for any format)
+
+        # Catch bare emails anywhere
         email_match = re.search(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", line)
         if email_match:
-            candidates.append({
-                "name":  current_name,
-                "email": normalize_contact_email(email_match.group(1)),
-            })
+            candidates.append({"name": current_name, "email": normalize_contact_email(email_match.group(1))})
             current_name = None
 
-    if candidates:
-        return candidates
+    if not candidates:
+        # Global fallback if lines failed
+        all_emails = re.findall(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", normalized)
+        all_names  = re.findall(r"Name[:\s]+([^\n\r|]+)", normalized, re.IGNORECASE)
+        for i, email in enumerate(all_emails):
+            name = all_names[i] if i < len(all_names) else None
+            candidates.append({"name": normalize_contact_name(name), "email": normalize_contact_email(email)})
 
-    # Fallback: grab whatever name/email exist anywhere in the text
-    names  = re.findall(r"Name[:\s]+([A-Z][a-zA-Z\s\-\']+)", normalized)
-    emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", normalized)
-    if names or emails:
-        return [{
-            "name":  normalize_contact_name(names[0]) if names else None,
-            "email": normalize_contact_email(emails[0]) if emails else None,
-        }]
-    return []
+    return dedupe_candidates(candidates)
 
 
 def dedupe_candidates(candidates):
@@ -291,16 +337,16 @@ def ocr_image(img_path):
     return text
 
 
-def extract_site_contact(email):
+def extract_site_contact(email_item):
     """OCR inline images and return deduplicated contact candidates."""
     candidates  = []
-    image_paths = extract_inline_images(email)
+    image_paths = extract_inline_images(email_item)
     for img_path in image_paths:
         try:
             img = Image.open(img_path)
-            # Skip tiny images (logos, icons)
             if img.width < 200 or img.height < 50:
                 continue
+                
             text = ocr_image(img_path)
             candidates.extend(extract_contact_candidates_from_text(text))
         except Exception:
@@ -324,70 +370,63 @@ def parse_visit_date(date_str):
 # EMAIL BODY
 # ============================================================================
 
-def build_email_body(contact_name, client_label, day_name, formatted_date):
+def build_email_body(contact_name, client_label, site_address, day_name, formatted_date):
     hour     = datetime.now().hour
     greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+    first_name = contact_name.split()[0] if contact_name else "[Name]"
+    
     return (
-        f"{greeting} {contact_name},\n\n"
-        f"I have been provided your contact details by {client_label}, in regards to booking in a small targeted "
-        f"asbestos survey for the above-named premises, prior to their installation works.\n\n"
-        f"The survey is predominately external so will not cause any disruption to any on-site members of staff "
-        f"or guests, and should only take around 30-40 minutes, would it be possible to send a surveyor on "
-        f"{day_name} {formatted_date} to undertake the survey please?\n\n"
+        f"{greeting} {first_name},\n\n"
+        f"My name is Aidan and I work for Greenshield Environmental. I have been provided your contact details by {client_label}, "
+        f"in regards to booking in a small targeted asbestos survey for the below-named premises, prior to their installation works.\n\n"
+        f"{site_address}\n\n"
+        f"The survey is predominately external so will not cause any disruption to any on-site members of staff or guests, "
+        f"and should only take around 30-40 minutes, would it be possible to send a surveyor on {day_name} {formatted_date} "
+        f"to undertake the survey please?\n\n"
         f"Any issues please do not hesitate to reply to this email.\n"
-        f"Kind regards,\n"
-        f"Aidan Smith."
+        f"Kind regards,\nAidan Smith."
     )
 
 
-def build_email_body_html(contact_name, client_label, day_name, formatted_date):
+def build_email_body_html(contact_name, client_label, site_address, day_name, formatted_date):
     hour     = datetime.now().hour
     greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+    first_name = contact_name.split()[0] if contact_name else "[Name]"
+    addr_html = site_address.replace(", ", "<br>")
+
     return (
-        f"<p>{greeting} {contact_name},</p>"
-        f"<p>I have been provided your contact details by {client_label}, in regards to booking in a small targeted "
-        f"asbestos survey for the above-named premises, prior to their installation works.</p>"
-        f"<p>The survey is predominately external so will not cause any disruption to any on-site members of staff "
-        f"or guests, and should only take around 30-40 minutes, would it be possible to send a surveyor on "
-        f"{day_name} {formatted_date} to undertake the survey please?</p>"
+        f"<p>{greeting} {first_name},</p>"
+        f"<p>My name is Aidan and I work for Greenshield Environmental. I have been provided your contact details by {client_label}, "
+        f"in regards to booking in a small targeted asbestos survey for the below-named premises, prior to their installation works.</p>"
+        f"<p><b>{addr_html}</b></p>"
+        f"<p>The survey is predominately external so will not cause any disruption to any on-site members of staff or guests, "
+        f"and should only take around 30-40 minutes, would it be possible to send a surveyor on {day_name} {formatted_date} "
+        f"to undertake the survey please?</p>"
         f"<p>Any issues please do not hesitate to reply to this email.<br>"
         f"Kind regards,<br>Aidan Smith.</p>"
     )
 
 
 # ============================================================================
-# OUTLOOK FORWARD DRAFT
+# OUTLOOK DRAFTING
 # ============================================================================
 
-def open_forward_draft(email, to_email, subject, plain_body, html_intro):
-    """Forward the original Lewis email with our intro prepended."""
+def open_new_draft(to_email, subject, html_body):
+    """Creates a brand new email draft in Outlook."""
     try:
-        outlook   = win32com.client.Dispatch("Outlook.Application")
-        namespace = outlook.GetNamespace("MAPI")
-
-        message_id  = email["message_id"]
-        store_id    = email["store_id"]
-        source_item = (
-            namespace.GetItemFromID(message_id, store_id)
-            if store_id
-            else namespace.GetItemFromID(message_id)
-        )
-
-        draft         = source_item.Forward()
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        draft = outlook.CreateItem(0) # 0 = olMailItem
+        
         draft.To      = to_email
         draft.Subject = subject
-
-        if draft.HTMLBody:
-            draft.HTMLBody = html_intro + draft.HTMLBody
-        else:
-            draft.Body = plain_body + "\n\n" + "-" * 40 + "\n" + draft.Body
+        draft.HTMLBody = html_body
 
         draft.Save()
         draft.Display()
-        print("[OK] Forward draft opened in Outlook. Review and send manually.")
+        print("[OK] New draft opened in Outlook.")
 
     except Exception as e:
-        print(f"[ERROR] Could not create forward draft: {e}")
+        print(f"[ERROR] Could not create draft: {e}")
 
 
 # ============================================================================
@@ -495,24 +534,6 @@ def main():
             break
         except ValueError as e:
             print(f"  [!] {e}")
-
-    # --- Step 6: Preview & open forward draft ---
-    plain_body = build_email_body(contact["name"], client_label, day_name, formatted_date)
-    html_intro = build_email_body_html(contact["name"], client_label, day_name, formatted_date)
-    subject    = f"Asbestos Survey Booking - {formatted_date}"
-
-    print("\n" + "=" * 60)
-    print(f"To:      {contact['email']}")
-    print(f"Subject: {subject}")
-    print("-" * 60)
-    print(plain_body)
-    print("=" * 60)
-
-    if prompt("\nOpen forward draft in Outlook? (y/n): ", allowed={"y", "n"}) != "y":
-        print("[INFO] Cancelled.")
-        return
-
-    open_forward_draft(selected, contact["email"], subject, plain_body, html_intro)
 
     # --- Step 7: Mark as sent ---
     sent = prompt("\nHave you sent the email? (y/n): ", allowed={"y", "n"})
