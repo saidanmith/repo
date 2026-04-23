@@ -7,7 +7,7 @@ from datetime import datetime
 import pythoncom
 
 # Import the logic you already built
-import app.src.email_logic as email_logic 
+import email_logic
 
 class FetchEmailsThread(QThread):
     """Background thread to fetch emails so the UI doesn't freeze."""
