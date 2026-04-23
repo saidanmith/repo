@@ -17,7 +17,7 @@ class FetchEmailsThread(QThread):
     def run(self):
         pythoncom.CoInitialize()
         try:
-            emails = email_logic.get_lewis_emails()
+            emails = email_logic.get_asbestos_request_emails()
             self.finished.emit(emails)
         except Exception as e:
             self.error.emit(str(e))

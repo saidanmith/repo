@@ -77,9 +77,9 @@ def get_mail_item(message_id, store_id=None):
         return None
 
 
-def get_lewis_emails():
-    """Fetch unhandled asbestos survey request emails from Lewis Dunkley."""
-    print("\n[INFO] Connecting to Outlook...")
+def get_asbestos_request_emails():
+    """Fetch all unhandled asbestos survey request emails."""
+    print("\n[INFO] Connecting to Outlook and searching for survey requests...")
     sent_ids = load_sent_log()
 
     try:
@@ -106,23 +106,19 @@ def get_lewis_emails():
             return []
 
         emails       = []
-        search_terms = ["lewis", "dunkley", "l.dunkley"]
-        target_email = "l.dunkley@greenshieldenvironmental.co.uk"
 
         items = inbox.Items
         for i in range(1, items.Count + 1):
             item = items.Item(i)
             try:
-                sender_name  = str(item.SenderName).lower()
                 sender_email = str(getattr(item, "SenderEmailAddress", "")).lower()
                 subject      = str(getattr(item, "Subject", "") or "")
                 entry_id     = item.EntryID
 
-                is_lewis   = any(t in sender_name for t in search_terms) or target_email in sender_email
                 is_survey  = EMAIL_SUBJECT_FILTER in subject.lower()
                 is_handled = entry_id in sent_ids
 
-                if is_lewis and is_survey and not is_handled:
+                if is_survey and not is_handled:
                     emails.append({
                         "sender":        item.SenderName,
                         "sender_email":  sender_email,
@@ -464,9 +460,9 @@ def main():
     print("=" * 60)
 
     # --- Step 1: Fetch emails ---
-    emails = get_lewis_emails()
+    emails = get_asbestos_request_emails()
     if not emails:
-        print("\n[INFO] No unhandled asbestos survey request emails found from Lewis.")
+        print("\n[INFO] No unhandled asbestos survey request emails found.")
         return
 
     print(f"\nFound {len(emails)} unhandled email(s):\n")
