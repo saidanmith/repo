@@ -24,6 +24,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 TEMP_DIR      = PROJECT_ROOT / "temp"
 LOGS_DIR      = PROJECT_ROOT / "logs"
 SENT_LOG_FILE = LOGS_DIR / "sent_log.json"
+PROCESS_LOG   = PROJECT_ROOT / "process_log.txt"
 
 # Ensure directories exist
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -36,6 +37,13 @@ UK_POSTCODE_RE = re.compile(
     r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b",
     re.IGNORECASE,
 )
+
+def log_operation(operation, target, outcome):
+    """Structured logging per INSTRUCTIONS.md."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}, {operation}, {target}, {outcome}]\n"
+    with open(PROCESS_LOG, "a", encoding="utf-8") as f:
+        f.write(log_entry)
 
 # ============================================================================
 # SENT LOG
@@ -537,6 +545,7 @@ def main():
         log = load_sent_log()
         log.add(selected["message_id"])
         save_sent_log(log)
+        log_operation("MARK_HANDLED", selected["message_id"], "SUCCESS")
         print("[OK] Marked as handled. Won't appear in future runs.")
     else:
         print("[INFO] Not marked as sent. Will appear again next time.")
