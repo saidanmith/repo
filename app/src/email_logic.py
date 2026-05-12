@@ -5,7 +5,7 @@ import pytesseract
 import pdfplumber
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ============================================================================
 # CONFIG (Updated for Source Layout)
@@ -283,18 +283,19 @@ def normalize_contact_email(email):
 def extract_contact_candidates_from_text(text):
     normalized = text.replace("\r", "\n")
 
-    candidates   = []
-    lines        = [l.strip() for l in normalized.splitlines() if l.strip()]
+    candidates = []
+    lines = [l.strip() for l in normalized.splitlines() if l.strip()]
     current_name = None
 
     for line in lines:
-        # Broaden matches to handle leading OCR noise (like '| Name:')
-        name_match = re.search(r"Name\b[:\s]+(.+)", line, re.IGNORECASE)
+        # Look for name patterns: Name:, Contact:, etc.
+        name_match = re.search(r"(?:Name|Contact|Site Contact)\b[:\s]+(.+)", line, re.IGNORECASE)
         if name_match:
             current_name = normalize_contact_name(name_match.group(1))
             continue
             
-        email_label_match = re.search(r"Email(?:\s*Address)?\b[:\s]+(.+)", line, re.IGNORECASE)
+        # Look for email patterns: Email:, Contact Email:, etc.
+        email_label_match = re.search(r"(?:Email|Contact Email|Email Address)\b[:\s]+(.+)", line, re.IGNORECASE)
         if email_label_match:
             email_match = re.search(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", email_label_match.group(1))
             if email_match:
@@ -308,13 +309,18 @@ def extract_contact_candidates_from_text(text):
             candidates.append({"name": current_name, "email": normalize_contact_email(email_match.group(1))})
             current_name = None
 
+    # Global fallback: find all emails and try to associate with nearby names
     if not candidates:
-        # Global fallback if lines failed
         all_emails = re.findall(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", normalized)
-        all_names  = re.findall(r"Name[:\s]+([^\n\r|]+)", normalized, re.IGNORECASE)
-        for i, email in enumerate(all_emails):
-            name = all_names[i] if i < len(all_names) else None
-            candidates.append({"name": normalize_contact_name(name), "email": normalize_contact_email(email)})
+        # Look for names near emails (within a few lines)
+        for match in re.finditer(r"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", normalized):
+            email = normalize_contact_email(match.group(1))
+            # Look backwards for a name
+            start = match.start()
+            before_text = normalized[:start]
+            name_match = re.search(r"([A-Za-z\s]{3,20})(?:\s|$)", before_text[-100:], re.IGNORECASE)
+            name = normalize_contact_name(name_match.group(1)) if name_match else None
+            candidates.append({"name": name, "email": email})
 
     return dedupe_candidates(candidates)
 
@@ -330,32 +336,77 @@ def dedupe_candidates(candidates):
 
 
 def ocr_image(img_path):
-    """OCR an image, retrying with inverted colours if the image is dark."""
+    """OCR an image with enhanced preprocessing for better accuracy."""
     img = Image.open(img_path).convert("RGB")
-    text = pytesseract.image_to_string(img)
-    # If no useful text found and image appears dark, try inverting
-    if not re.search(r"[a-zA-Z]{3,}", text):
-        from PIL import ImageOps
-        inverted = ImageOps.invert(img)
-        text = pytesseract.image_to_string(inverted)
-    return text
+    
+    # Convert to grayscale
+    gray = img.convert("L")
+    
+    # Apply thresholding to get binary image
+    thresh = gray.point(lambda x: 0 if x < 128 else 255, 'L')
+    
+    # Try OCR on original, grayscale, and thresholded
+    texts = []
+    for img_variant in [img, gray, thresh]:
+        try:
+            text = pytesseract.image_to_string(img_variant, config='--psm 6')
+            texts.append(text)
+        except Exception as e:
+            print(f"[DEBUG] OCR failed on variant: {e}")
+            texts.append("")
+    
+    # Choose the best text (longest with letters)
+    best_text = max(texts, key=lambda t: len(re.findall(r'[a-zA-Z]', t)))
+    
+    # If still no useful text, try inverting the thresholded image
+    if not re.search(r"[a-zA-Z]{3,}", best_text):
+        inverted_thresh = ImageOps.invert(thresh)
+        try:
+            inv_text = pytesseract.image_to_string(inverted_thresh, config='--psm 6')
+            if len(re.findall(r'[a-zA-Z]', inv_text)) > len(re.findall(r'[a-zA-Z]', best_text)):
+                best_text = inv_text
+        except Exception as e:
+            print(f"[DEBUG] Inverted OCR failed: {e}")
+    
+    print(f"[DEBUG] OCR result for {img_path.name}: '{best_text[:100]}...'")
+    return best_text
 
 
 def extract_site_contact(email_item):
-    """OCR inline images and return deduplicated contact candidates."""
-    candidates  = []
+    """OCR inline images and parse email body for contact candidates."""
+    candidates = []
+    
+    # First, try OCR on images
     image_paths = extract_inline_images(email_item)
+    print(f"[DEBUG] Found {len(image_paths)} images to OCR")
     for img_path in image_paths:
         try:
             img = Image.open(img_path)
             if img.width < 200 or img.height < 50:
+                print(f"[DEBUG] Skipping small image: {img.width}x{img.height}")
                 continue
                 
             text = ocr_image(img_path)
-            candidates.extend(extract_contact_candidates_from_text(text))
-        except Exception:
-            pass
-    return dedupe_candidates(candidates)
+            img_candidates = extract_contact_candidates_from_text(text)
+            print(f"[DEBUG] Extracted {len(img_candidates)} candidates from {img_path.name}")
+            candidates.extend(img_candidates)
+        except Exception as e:
+            print(f"[DEBUG] Error OCRing {img_path.name}: {e}")
+    
+    # If no candidates from images, try parsing the email body
+    if not candidates:
+        try:
+            body_text = str(getattr(email_item, 'Body', '') or '')
+            print(f"[DEBUG] Parsing email body for contacts")
+            body_candidates = extract_contact_candidates_from_text(body_text)
+            print(f"[DEBUG] Extracted {len(body_candidates)} candidates from email body")
+            candidates.extend(body_candidates)
+        except Exception as e:
+            print(f"[DEBUG] Error parsing email body: {e}")
+    
+    final_candidates = dedupe_candidates(candidates)
+    print(f"[DEBUG] Final deduped candidates: {final_candidates}")
+    return final_candidates
 
 
 # ============================================================================
